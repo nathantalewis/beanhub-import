@@ -1163,6 +1163,200 @@ def test_compute_changes(
     } == expected
 
 
+def test_extract_existing_transactions_with_balance_assertions(parser: Lark, tmp_path: pathlib.Path):
+    """Test that extract_existing_transactions detects both transactions and balance assertions."""
+    # Create a test beancount file with both transactions and balance assertions
+    bean_content = '''
+2024-01-01 * "Test Transaction"
+  import-id: "txn:test:1"
+  Assets:Cash    100.00 USD
+  Income:Test   -100.00 USD
+
+2024-01-02 balance Assets:Cash  100.00 USD
+  import-id: "balance:Assets:Cash:2024-01-02"
+  import-src: "test.ofx"
+
+2024-01-03 * "Another Transaction"
+  import-id: "txn:test:2"
+  Assets:Cash    -50.00 USD
+  Expenses:Test   50.00 USD
+'''
+    
+    bean_file = tmp_path / "test.bean"
+    bean_file.write_text(bean_content.strip())
+    
+    # Extract existing transactions
+    results = list(extract_existing_transactions(parser, bean_file))
+    
+    # Should find both transactions and balance assertion
+    assert len(results) == 3
+    
+    # Check that we found the expected IDs
+    found_ids = {txn.id for txn in results}
+    expected_ids = {"txn:test:1", "balance:Assets:Cash:2024-01-02", "txn:test:2"}
+    assert found_ids == expected_ids
+    
+    # Verify the balance assertion was detected correctly
+    balance_txn = next(txn for txn in results if txn.id == "balance:Assets:Cash:2024-01-02")
+    assert balance_txn.file == bean_file
+    assert balance_txn.lineno == 6  # Line number of the balance assertion
+
+
+def test_compute_changes_with_balance_assertions(tmp_path: pathlib.Path):
+    """Test that compute_changes handles balance assertions without marking them as dangling."""
+    from beanhub_import.post_processor import compute_changes
+    from beanhub_import.data_types import GeneratedBalance, Amount
+    
+    # Create generated transactions and balance assertions
+    generated_txns = [
+        GeneratedTransaction(
+            id="txn:test:1",
+            sources=["test.csv"],
+            date="2024-01-01",
+            flag="*",
+            narration="Test Transaction",
+            file="main.bean",
+            postings=[],
+        )
+    ]
+    
+    generated_balances = [
+        GeneratedBalance(
+            id="balance:Assets:Cash:2024-01-02",
+            sources=["test.ofx"],
+            date="2024-01-02",
+            account="Assets:Cash",
+            amount=Amount(number="100.00", currency="USD"),
+            meta=None,
+        )
+    ]
+    
+    # Create existing imported transactions (both transaction and balance assertion)
+    imported_txns = [
+        BeancountTransaction(
+            file=tmp_path / "main.bean",
+            lineno=1,
+            id="txn:test:1",
+        ),
+        BeancountTransaction(
+            file=tmp_path / "main.bean", 
+            lineno=5,
+            id="balance:Assets:Cash:2024-01-02",
+        ),
+    ]
+    
+    # Compute changes
+    changes = compute_changes(
+        generated_txns=generated_txns,
+        imported_txns=imported_txns,
+        work_dir=tmp_path,
+        generated_balances=generated_balances,
+    )
+    
+    # Verify results
+    assert len(changes) == 1
+    change_set = changes[tmp_path / "main.bean"]
+    
+    # Should have 2 updates (1 transaction + 1 balance assertion) and no dangling
+    assert len(change_set.update) == 2
+    assert len(change_set.dangling) == 0
+    assert len(change_set.add) == 0
+    assert len(change_set.remove) == 0
+    
+    # Verify both the transaction and balance assertion are in updates
+    assert 1 in change_set.update  # Transaction at line 1
+    assert 5 in change_set.update  # Balance assertion at line 5
+
+
+def test_compute_changes_balance_assertion_prevents_dangling(tmp_path: pathlib.Path):
+    """Test that balance assertions are not marked as dangling when they have corresponding generated balances."""
+    from beanhub_import.post_processor import compute_changes
+    from beanhub_import.data_types import GeneratedBalance, Amount
+    
+    # No generated transactions, only a generated balance assertion
+    generated_txns = []
+    
+    generated_balances = [
+        GeneratedBalance(
+            id="balance:Assets:Cash:2024-01-02",
+            sources=["test.ofx"],
+            date="2024-01-02", 
+            account="Assets:Cash",
+            amount=Amount(number="100.00", currency="USD"),
+            meta=None,
+        )
+    ]
+    
+    # Existing balance assertion in the file
+    imported_txns = [
+        BeancountTransaction(
+            file=tmp_path / "main.bean",
+            lineno=5,
+            id="balance:Assets:Cash:2024-01-02",
+        ),
+    ]
+    
+    # Compute changes
+    changes = compute_changes(
+        generated_txns=generated_txns,
+        imported_txns=imported_txns,
+        work_dir=tmp_path,
+        generated_balances=generated_balances,
+    )
+    
+    # Verify the balance assertion is updated, not marked as dangling
+    change_set = changes[tmp_path / "main.bean"]
+    assert len(change_set.update) == 1
+    assert len(change_set.dangling) == 0
+    assert 5 in change_set.update
+
+
+def test_compute_changes_balance_assertion_new_file(tmp_path: pathlib.Path):
+    """Test that new balance assertions are added to appropriate files."""
+    from beanhub_import.post_processor import compute_changes
+    from beanhub_import.data_types import GeneratedBalance, Amount
+    
+    # Generate a new balance assertion with no existing transactions
+    generated_txns = []
+    
+    generated_balances = [
+        GeneratedBalance(
+            id="balance:Assets:Cash:2024-01-02",
+            sources=["test.ofx"],
+            date="2024-01-02",
+            account="Assets:Cash", 
+            amount=Amount(number="100.00", currency="USD"),
+            meta=None,
+        )
+    ]
+    
+    # No existing imported transactions
+    imported_txns = []
+    
+    # Compute changes
+    changes = compute_changes(
+        generated_txns=generated_txns,
+        imported_txns=imported_txns,
+        work_dir=tmp_path,
+        generated_balances=generated_balances,
+    )
+    
+    # Should create a new balances.bean file
+    assert len(changes) == 1
+    balance_file = tmp_path / "balances.bean"
+    assert balance_file in changes
+    
+    change_set = changes[balance_file]
+    assert len(change_set.add) == 1
+    assert len(change_set.update) == 0
+    assert len(change_set.dangling) == 0
+    
+    # Verify the added item is a converted balance assertion (GeneratedTransaction with flag="balance")
+    added_txn = change_set.add[0]
+    assert added_txn.flag == "balance"
+    assert added_txn.id == "balance:Assets:Cash:2024-01-02"
+
+
 @pytest.mark.parametrize(
     "bean_file, change_set, remove_dangling, expected_file",
     [

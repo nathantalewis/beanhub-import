@@ -89,6 +89,7 @@ class ActionType(str, enum.Enum):
     add_txn = "add_txn"
     del_txn = "del_txn"
     ignore = "ignore"
+    balance = "balance"
 
 
 class AmountTemplate(ImportBaseModel):
@@ -164,6 +165,23 @@ class DeletedTransaction(ImportBaseModel):
     id: str
 
 
+class GeneratedBalance(ImportBaseModel):
+    """Represents a balance assertion: YYYY-MM-DD balance Account Amount"""
+    sources: list[str] | None = None
+    id: str
+    date: str
+    account: str
+    amount: Amount
+    meta: dict[str, str] | None = None
+
+
+class BalanceTemplate(ImportBaseModel):
+    date: str | None = None
+    account: str
+    amount: AmountTemplate
+    meta: dict[str, str] | None = None
+
+
 class ActionAddTxn(ImportBaseModel):
     type: typing.Literal[ActionType.add_txn] = pydantic.Field(ActionType.add_txn)
     file: str | None = None
@@ -179,7 +197,13 @@ class ActionIgnore(ImportBaseModel):
     type: typing.Literal[ActionType.ignore] = pydantic.Field(ActionType.ignore)
 
 
-Action = ActionAddTxn | ActionDelTxn | ActionIgnore
+class ActionBalance(ImportBaseModel):
+    type: typing.Literal[ActionType.balance] = pydantic.Field(ActionType.balance)
+    file: str | None = None
+    balance: BalanceTemplate
+
+
+Action = ActionAddTxn | ActionDelTxn | ActionIgnore | ActionBalance
 
 SimpleFileMatch = str | StrExactMatch | StrRegexMatch
 

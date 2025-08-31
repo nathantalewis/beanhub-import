@@ -22,9 +22,11 @@ from beanhub_extract.utils import strip_txn_base_path
 from jinja2.sandbox import SandboxedEnvironment
 
 from . import constants
+from .data_types import ActionBalance
 from .data_types import ActionType
 from .data_types import Amount
 from .data_types import DeletedTransaction
+from .data_types import GeneratedBalance
 from .data_types import Filter
 from .data_types import FilterFieldOperation
 from .data_types import FilterOperator
@@ -293,6 +295,11 @@ def process_transaction(
             if action.type == ActionType.ignore:
                 logger.debug("Ignored transaction %s:%s", txn.file, txn.lineno)
                 return None
+            
+            if action.type == ActionType.balance:
+                yield from process_balance_action(action, txn, template_env, txn_ctx, matched_vars)
+                processed = True
+                continue
 
             txn_id = first_non_none(
                 getattr(action.txn, "id") if action.txn is not None else None,
@@ -574,11 +581,69 @@ def extend_import_match_rules(
     return import_rule
 
 
+def process_balance_action(
+    action: ActionBalance,
+    txn: Transaction,
+    template_env: SandboxedEnvironment,
+    txn_ctx: dict[str, typing.Any],
+    matched_vars: dict[str, str] | None = None,
+) -> typing.Generator[GeneratedBalance, None, None]:
+    """Process a balance action and generate a balance assertion."""
+    def render_str(value: str | None) -> str | None:
+        if value is None:
+            return None
+        template_ctx = txn_ctx
+        if matched_vars is not None:
+            template_ctx |= matched_vars
+        return template_env.from_string(value).render(**template_ctx)
+    
+    # Render the balance template
+    balance_date = render_str(
+        action.balance.date or "{{ date }}"
+    )
+    
+    balance_account = render_str(action.balance.account)
+    
+    balance_amount_number = render_str(
+        action.balance.amount.number or "{{ amount }}"
+    )
+    
+    balance_amount_currency = render_str(
+        action.balance.amount.currency or "{{ currency }}"
+    )
+    
+    # Create metadata if provided
+    metadata = {}
+    if action.balance.meta:
+        for key, value_template in action.balance.meta.items():
+            rendered_value = render_str(value_template)
+            if rendered_value:  # Only add non-empty metadata
+                metadata[key] = rendered_value
+    
+    # Create the balance assertion
+    # In beancount, balance assertions are: YYYY-MM-DD balance Account Amount
+    balance_id = f"balance:{balance_account}:{balance_date}"
+    
+    generated_balance = GeneratedBalance(
+        sources=[txn.file],
+        id=balance_id,
+        date=balance_date,
+        account=balance_account,
+        amount=Amount(
+            number=balance_amount_number,
+            currency=balance_amount_currency,
+        ),
+        meta=metadata if metadata else None,
+    )
+    
+    yield generated_balance
+
+
 def process_imports(
     import_doc: ImportDoc,
     input_dir: pathlib.Path,
 ) -> typing.Generator[
-    GeneratedTransaction | DeletedTransaction | Transaction, None, None
+    GeneratedTransaction | GeneratedBalance | DeletedTransaction | Transaction, None, None
 ]:
     logger = logging.getLogger(__name__)
     template_env = make_environment()

@@ -16,12 +16,15 @@ from lark import Token
 from lark import Tree
 
 from . import constants
+from .data_types import Amount
 from .data_types import BeancountTransaction
 from .data_types import ChangeSet
 from .data_types import DeletedTransaction
+from .data_types import GeneratedBalance
 from .data_types import GeneratedPosting
 from .data_types import GeneratedTransaction
 from .data_types import ImportOverrideFlag
+from .data_types import MetadataItem
 from .data_types import TransactionStatement
 from .data_types import TransactionUpdate
 
@@ -68,7 +71,7 @@ def extract_existing_transactions(
             if first_child.data == "date_directive":
                 date_directive = first_child.children[0]
                 directive_type = date_directive.data.value
-                if directive_type != "txn":
+                if directive_type not in ("txn", "balance"):
                     continue
                 if last_txn is not None and import_id is not None:
                     yield BeancountTransaction(
@@ -103,10 +106,17 @@ def compute_changes(
     imported_txns: list[BeancountTransaction],
     work_dir: pathlib.Path,
     deleted_txns: list[DeletedTransaction] | None = None,
+    generated_balances: list[GeneratedBalance] | None = None,
 ) -> dict[pathlib.Path, ChangeSet]:
     generated_id_txns = {txn.id: txn for txn in generated_txns}
     imported_id_txns = {txn.id: txn for txn in imported_txns}
     deleted_txn_ids = set(txn.id for txn in (deleted_txns or ()))
+    
+    # Create a combined lookup that includes both transactions and balance assertions
+    # This prevents balance assertions from being marked as dangling
+    all_generated_ids = set(generated_id_txns.keys())
+    if generated_balances:
+        all_generated_ids.update(balance.id for balance in generated_balances)
 
     to_remove = collections.defaultdict(list)
     dangling_txns = collections.defaultdict(list)
@@ -121,8 +131,8 @@ def compute_changes(
         ):
             # it appears that the generated txn's file is different from the old one, let's remove it
             to_remove[txn.file].append(txn)
-        elif generated_txn is None and txn.override is None:
-            # we have existing imported txn without override flags but has no corresponding generated txn,
+        elif txn.id not in all_generated_ids and txn.override is None:
+            # we have existing imported txn without override flags but has no corresponding generated txn or balance,
             # let's add it to danging txns
             dangling_txns[txn.file].append(txn)
 
@@ -139,6 +149,29 @@ def compute_changes(
             )
         else:
             to_add[generated_file].append(txn)
+
+    # Handle balance assertions the same way as transactions
+    if generated_balances:
+        for balance in generated_balances:
+            if balance.id in deleted_txn_ids:
+                continue
+            imported_txn = imported_id_txns.get(balance.id)
+            
+            if imported_txn is not None:
+                # Balance assertion already exists - use the same file and update it
+                balance_file = imported_txn.file.resolve()
+                to_update[balance_file][imported_txn.lineno] = TransactionUpdate(
+                    txn=_balance_to_transaction(balance), override=imported_txn.override
+                )
+            else:
+                # New balance assertion - determine which file to use
+                # Use the first file from to_add, or create a default file
+                if to_add:
+                    balance_file = next(iter(to_add.keys()))
+                else:
+                    balance_file = work_dir / "balances.bean"
+                # Convert to transaction for the existing pipeline
+                to_add[balance_file].append(_balance_to_transaction(balance))
 
     all_files = (
         frozenset(to_remove.keys())
@@ -184,6 +217,36 @@ def posting_to_text(posting: GeneratedPosting) -> str:
 def txn_to_text(
     txn: GeneratedTransaction,
 ) -> str:
+    # Check if this is a balance assertion (marked with flag="balance")
+    if txn.flag == "balance":
+        # Extract balance information from metadata
+        balance_account = None
+        balance_amount = None
+        balance_currency = None
+        meta = {}
+        
+        if txn.metadata:
+            for item in txn.metadata:
+                if item.name == "__balance_account__":
+                    balance_account = item.value
+                elif item.name == "__balance_amount__":
+                    balance_amount = item.value
+                elif item.name == "__balance_currency__":
+                    balance_currency = item.value
+                else:
+                    meta[item.name] = item.value
+        
+        # Reconstruct the GeneratedBalance from the transaction data
+        balance = GeneratedBalance(
+            sources=txn.sources,
+            id=txn.id,
+            date=txn.date,
+            account=balance_account,
+            amount=Amount(number=balance_amount, currency=balance_currency),
+            meta=meta if meta else None,
+        )
+        return render_balance_assertion(balance)
+    
     columns = [
         txn.date,
         txn.flag,
@@ -352,6 +415,80 @@ def update_transaction(
     if ImportOverrideFlag.POSTINGS in transaction_update.override:
         replacement["postings"] = new_entry.postings
     return entry._replace(**replacement)
+
+
+def render_balance_assertion(balance: GeneratedBalance) -> str:
+    """Render a GeneratedBalance as a beancount balance assertion."""
+    from . import constants
+    import json
+    
+    # Handle import-src the same way as transactions
+    import_src = None
+    if balance.sources is not None:
+        import_src = ":".join(balance.sources)
+    
+    # Handle custom metadata
+    extra_metadata = []
+    if balance.meta is not None:
+        for key, value in balance.meta.items():
+            if key in frozenset([constants.IMPORT_ID_KEY, constants.IMPORT_SRC_KEY]):
+                raise ValueError(
+                    f"Metadata item name {key} is reserved for beanhub-import usage"
+                )
+            extra_metadata.append(f"  {key}: {json.dumps(value)}")
+    
+    # Build the balance assertion with metadata
+    lines = [
+        f"{balance.date} balance {balance.account}  {balance.amount.number} {balance.amount.currency}",
+        f"  {constants.IMPORT_ID_KEY}: {json.dumps(balance.id)}",
+        *(
+            (f"  {constants.IMPORT_SRC_KEY}: {json.dumps(import_src)}",)
+            if import_src is not None
+            else ()
+        ),
+        *extra_metadata,
+    ]
+    
+    return "\n".join(lines)
+
+
+def balance_to_text(balance: GeneratedBalance) -> str:
+    """Convert a GeneratedBalance to text, similar to txn_to_text."""
+    return render_balance_assertion(balance)
+
+
+def _balance_to_transaction(balance: GeneratedBalance) -> GeneratedTransaction:
+    """Convert a GeneratedBalance to a GeneratedTransaction for the existing pipeline.
+    
+    This allows balance assertions to be processed through the same ChangeSet mechanism
+    as transactions, ensuring consistent handling of add/update/remove operations.
+    """
+    # Store balance amount in metadata
+    metadata = []
+    if balance.meta:
+        for key, value in balance.meta.items():
+            metadata.append(MetadataItem(name=key, value=value))
+    
+    # Add balance-specific metadata
+    metadata.extend([
+        MetadataItem(name="__balance_account__", value=balance.account),
+        MetadataItem(name="__balance_amount__", value=balance.amount.number),
+        MetadataItem(name="__balance_currency__", value=balance.amount.currency),
+    ])
+    
+    return GeneratedTransaction(
+        sources=balance.sources,
+        file="balance.bean",  # Default file for balance assertions
+        id=balance.id,
+        date=balance.date,
+        flag="balance",  # Special flag to mark this as a balance assertion
+        payee=None,
+        narration="Balance assertion",  # Generic narration
+        postings=[],  # Empty postings for balance assertion
+        tags=None,
+        links=None,
+        metadata=metadata,
+    )
 
 
 def apply_change_set(

@@ -11,15 +11,18 @@ from beanhub_extract.data_types import Transaction
 from jinja2.sandbox import SandboxedEnvironment
 
 from beanhub_import.data_types import ActionAddTxn
+from beanhub_import.data_types import ActionBalance
 from beanhub_import.data_types import ActionDelTxn
 from beanhub_import.data_types import ActionIgnore
 from beanhub_import.data_types import Amount
 from beanhub_import.data_types import AmountTemplate
+from beanhub_import.data_types import BalanceTemplate
 from beanhub_import.data_types import DeletedTransaction
 from beanhub_import.data_types import DeleteTransactionTemplate
 from beanhub_import.data_types import FilterFieldOperation
 from beanhub_import.data_types import FilterOperator
 from beanhub_import.data_types import FiltersAdapter
+from beanhub_import.data_types import GeneratedBalance
 from beanhub_import.data_types import GeneratedPosting
 from beanhub_import.data_types import GeneratedTransaction
 from beanhub_import.data_types import ImportDoc
@@ -2371,3 +2374,244 @@ def test_process_imports(
         payload = yaml.safe_load(fo)
     doc = ImportDoc.model_validate(payload)
     assert list(process_imports(import_doc=doc, input_dir=folder_path)) == expected
+
+
+def test_process_balance_action():
+    """Test that balance actions generate proper balance assertions."""
+    from beanhub_import.processor import process_balance_action
+    
+    # Create a mock template environment
+    template_env = SandboxedEnvironment()
+    
+    # Create a test transaction
+    txn = Transaction(
+        extractor="capital_one_ofx",
+        file="test.ofx",
+        lineno=1,
+        transaction_id="BALANCE_123",
+        date=datetime.date(2025, 8, 23),
+        post_date=datetime.date(2025, 8, 23),
+        desc="Balance as of 2025-08-23",
+        amount=decimal.Decimal("-100.22"),
+        type="BALANCE",
+        currency="USD",
+        source_account="0574",
+        last_four_digits="0574",
+    )
+    
+    # Create a balance action
+    balance_action = ActionBalance(
+        type="balance",
+        file="balance.bean",
+        balance=BalanceTemplate(
+            date="{{ date }}",
+            account="Liabilities:Capital-One",
+            amount=AmountTemplate(
+                number="{{ amount }}",
+                currency="{{ currency }}"
+            ),
+            meta={
+                "last_four_digits": "{{ last_four_digits }}"
+            }
+        )
+    )
+    
+    # Create template context
+    txn_ctx = {
+        "date": "2025-08-23",
+        "amount": "-100.22",
+        "currency": "USD",
+        "last_four_digits": "0574",
+    }
+    
+    # Process the balance action
+    results = list(process_balance_action(balance_action, txn, template_env, txn_ctx))
+    
+    # Verify results
+    assert len(results) == 1
+    generated_balance = results[0]
+    
+    assert isinstance(generated_balance, GeneratedBalance)
+    assert generated_balance.sources == ["test.ofx"]
+    assert generated_balance.id == "balance:Liabilities:Capital-One:2025-08-23"
+    assert generated_balance.date == "2025-08-23"
+    assert generated_balance.account == "Liabilities:Capital-One"
+    assert generated_balance.amount.number == "-100.22"
+    assert generated_balance.amount.currency == "USD"
+    
+    # Check metadata
+    assert generated_balance.meta is not None
+    assert generated_balance.meta["last_four_digits"] == "0574"
+
+
+def test_balance_action_with_account_mapping():
+    """Test balance action with dynamic account mapping."""
+    from beanhub_import.processor import process_balance_action
+    
+    template_env = SandboxedEnvironment()
+    
+    txn = Transaction(
+        extractor="capital_one_ofx",
+        file="test.ofx",
+        lineno=1,
+        transaction_id="BALANCE_456",
+        date=datetime.date(2025, 8, 23),
+        post_date=datetime.date(2025, 8, 23),
+        desc="Balance as of 2025-08-23",
+        amount=decimal.Decimal("-50.00"),
+        type="BALANCE",
+        currency="USD",
+        source_account="5556",
+        last_four_digits="5556",
+    )
+    
+    balance_action = ActionBalance(
+        type="balance",
+        balance=BalanceTemplate(
+            account="{{ account_mapping.capital_one_accounts[source_account] }}",
+            amount=AmountTemplate(
+                number="{{ amount }}",
+                currency="{{ currency }}"
+            )
+        )
+    )
+    
+    # Template context with account mapping
+    txn_ctx = {
+        "date": "2025-08-23",
+        "amount": "-50.00",
+        "currency": "USD",
+        "source_account": "5556",
+        "account_mapping": {
+            "capital_one_accounts": {
+                "0574": "Liabilities:Capital-One",
+                "5556": "Liabilities:Capital-One-Secondary"
+            }
+        }
+    }
+    
+    results = list(process_balance_action(balance_action, txn, template_env, txn_ctx))
+    
+    assert len(results) == 1
+    generated_balance = results[0]
+    
+    # Verify the account mapping worked
+    assert isinstance(generated_balance, GeneratedBalance)
+    assert generated_balance.sources == ["test.ofx"]
+    assert generated_balance.id == "balance:Liabilities:Capital-One-Secondary:2025-08-23"
+    assert generated_balance.account == "Liabilities:Capital-One-Secondary"
+    assert generated_balance.amount.number == "-50.00"
+    assert generated_balance.amount.currency == "USD"
+
+
+def test_render_balance_assertion():
+    """Test that balance assertions render correctly in beancount format."""
+    from beanhub_import.post_processor import render_balance_assertion
+    
+    # Test balance without custom metadata but with import metadata
+    balance_simple = GeneratedBalance(
+        sources=["test.ofx"],
+        id="balance:Liabilities:Capital-One:2025-08-23",
+        date="2025-08-23",
+        account="Liabilities:Capital-One",
+        amount=Amount(number="-100.22", currency="USD"),
+        meta=None
+    )
+    
+    rendered_simple = render_balance_assertion(balance_simple)
+    expected_simple = """2025-08-23 balance Liabilities:Capital-One  -100.22 USD
+  import-id: "balance:Liabilities:Capital-One:2025-08-23"
+  import-src: "test.ofx\""""
+    assert rendered_simple == expected_simple
+    
+    # Test balance with custom metadata
+    balance_with_meta = GeneratedBalance(
+        sources=["import-data/capitalOne/2025-08-23_transaction_download.ofx"],
+        id="balance:Liabilities:Capital-One:2025-08-23",
+        date="2025-08-23",
+        account="Liabilities:Capital-One",
+        amount=Amount(number="-100.22", currency="USD"),
+        meta={"last_four_digits": "0574", "source": "capital_one_ofx"}
+    )
+    
+    rendered_with_meta = render_balance_assertion(balance_with_meta)
+    expected_with_meta = """2025-08-23 balance Liabilities:Capital-One  -100.22 USD
+  import-id: "balance:Liabilities:Capital-One:2025-08-23"
+  import-src: "import-data/capitalOne/2025-08-23_transaction_download.ofx"
+  last_four_digits: "0574"
+  source: "capital_one_ofx\""""
+    assert rendered_with_meta == expected_with_meta
+
+
+def test_balance_action_integration():
+    """Test the complete balance action workflow including updates."""
+    from beanhub_import.processor import process_balance_action
+    
+    template_env = SandboxedEnvironment()
+    
+    # Create a test transaction
+    txn = Transaction(
+        extractor="capital_one_ofx",
+        file="test.ofx",
+        lineno=1,
+        transaction_id="BALANCE_123",
+        date=datetime.date(2025, 8, 23),
+        post_date=datetime.date(2025, 8, 23),
+        desc="Balance as of 2025-08-23",
+        amount=decimal.Decimal("-100.22"),
+        type="BALANCE",
+        currency="USD",
+        source_account="0574",
+        last_four_digits="0574",
+    )
+    
+    # Create a balance action
+    balance_action = ActionBalance(
+        type="balance",
+        balance=BalanceTemplate(
+            date="{{ date }}",
+            account="Liabilities:Capital-One",
+            amount=AmountTemplate(
+                number="{{ amount }}",
+                currency="{{ currency }}"
+            ),
+            meta={
+                "test_meta": "{{ source_account }}"
+            }
+        )
+    )
+    
+    # Template context
+    txn_ctx = {
+        "date": "2025-08-23",
+        "amount": "-100.22",
+        "currency": "USD",
+        "source_account": "0574",
+    }
+    
+    # Process the balance action
+    results = list(process_balance_action(balance_action, txn, template_env, txn_ctx))
+    
+    assert len(results) == 1
+    generated_balance = results[0]
+    
+    # Verify the balance has all required fields for update detection
+    assert generated_balance.id == "balance:Liabilities:Capital-One:2025-08-23"
+    assert generated_balance.sources == ["test.ofx"]
+    assert generated_balance.date == "2025-08-23"
+    assert generated_balance.account == "Liabilities:Capital-One"
+    assert generated_balance.amount.number == "-100.22"
+    assert generated_balance.amount.currency == "USD"
+    assert generated_balance.meta["test_meta"] == "0574"
+    
+    # Test that changing the amount creates a different balance
+    txn_ctx_updated = txn_ctx.copy()
+    txn_ctx_updated["amount"] = "-150.50"
+    
+    results_updated = list(process_balance_action(balance_action, txn, template_env, txn_ctx_updated))
+    generated_balance_updated = results_updated[0]
+    
+    # Should have same ID but different amount
+    assert generated_balance_updated.id == generated_balance.id
+    assert generated_balance_updated.amount.number == "-150.50"
+    assert generated_balance_updated.amount.number != generated_balance.amount.number
