@@ -21,6 +21,8 @@ from beanhub_extract.extractors import detect_extractor
 from beanhub_extract.utils import strip_txn_base_path
 from jinja2.sandbox import SandboxedEnvironment
 
+import chardet
+
 from . import constants
 from .data_types import ActionBalance
 from .data_types import ActionType
@@ -53,6 +55,33 @@ from .data_types import StrSuffixMatch
 from .data_types import TxnMatchVars
 from .data_types import UnprocessedTransaction
 from .templates import make_environment
+
+
+def detect_file_encoding(filepath: pathlib.Path) -> str:
+    """Detect the encoding of a file using chardet, with fallbacks for common encodings."""
+    try:
+        with filepath.open("rb") as f:
+            raw_data = f.read(10000)  # Read first 10KB for detection
+            result = chardet.detect(raw_data)
+            if result and result["encoding"] and result["confidence"] > 0.7:
+                return result["encoding"]
+    except Exception:
+        pass
+    
+    # Fallback to common encodings if chardet fails or has low confidence
+    common_encodings = ["utf-8", "iso-8859-1", "windows-1252", "cp1252"]
+    
+    for encoding in common_encodings:
+        try:
+            with filepath.open("rt", encoding=encoding) as f:
+                f.read(1000)  # Try to read first 1KB
+                return encoding
+        except UnicodeDecodeError:
+            continue
+    
+    # Last resort - use utf-8 with error handling
+    return "utf-8"
+
 
 FILTER_OPERATOR_MAP: dict[FilterOperator, typing.Callable] = {
     FilterOperator.equal: operator.eq,
@@ -669,7 +698,8 @@ def process_imports(
                 else None
             )
             if extractor_name is None:
-                with filepath.open("rt") as fo:
+                detected_encoding = detect_file_encoding(filepath)
+                with filepath.open("rt", encoding=detected_encoding) as fo:
                     extractor_cls = detect_extractor(fo)
                 if extractor_cls is None:
                     raise ValueError(
@@ -687,7 +717,8 @@ def process_imports(
             logger.info(
                 "Processing file %s with extractor %s", rel_filepath, extractor_name
             )
-            with filepath.open("rt") as fo:
+            detected_encoding = detect_file_encoding(filepath)
+            with filepath.open("rt", encoding=detected_encoding) as fo:
                 extractor = extractor_cls(fo)
                 for transaction in extractor():
                     txn = strip_txn_base_path(input_dir, transaction)
